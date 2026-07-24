@@ -39,9 +39,12 @@ import { useChatModels } from "@/hooks/use-chat-models"
 import { useGateway } from "@/hooks/use-gateway"
 import { usePicoChat } from "@/hooks/use-pico-chat"
 import { useSessionHistory } from "@/hooks/use-session-history"
-import type { AssistantDetailVisibility } from "@/store/chat"
-import type { ConnectionState } from "@/store/chat"
-import type { ChatAttachment } from "@/store/chat"
+import type {
+  AssistantDetailVisibility,
+  ChatAttachment,
+  ConnectionState,
+  ContextUsage,
+} from "@/store/chat"
 import {
   assistantDetailVisibilityAtom,
   shouldShowAssistantMessage,
@@ -100,16 +103,162 @@ function resolveChatInputDisabledReason({
   return null
 }
 
-export function ChatPage() {
+interface ChatInputAreaProps {
+  canInput: boolean
+  contextUsage?: ContextUsage
+  connectionState: ConnectionState
+  gatewayState: GatewayState
+  hasDefaultModel: boolean
+  sendMessage: (input: {
+    content: string
+    attachments: ChatAttachment[]
+  }) => boolean
+}
+
+function ChatInputArea({
+  canInput,
+  contextUsage,
+  connectionState,
+  gatewayState,
+  hasDefaultModel,
+  sendMessage,
+}: ChatInputAreaProps) {
   const { t } = useTranslation()
-  const scrollRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const dragDepthRef = useRef(0)
-  const [isAtBottom, setIsAtBottom] = useState(true)
-  const [hasScrolled, setHasScrolled] = useState(false)
   const [input, setInput] = useState("")
   const [attachments, setAttachments] = useState<ChatAttachment[]>([])
   const [isDragActive, setIsDragActive] = useState(false)
+
+  const inputDisabledReason = resolveChatInputDisabledReason({
+    hasDefaultModel,
+    connectionState,
+    gatewayState,
+  })
+  const canSubmit =
+    canInput && (Boolean(input.trim()) || attachments.length > 0)
+
+  const handleSend = () => {
+    if ((!input.trim() && attachments.length === 0) || !canInput) return
+    if (sendMessage({ content: input, attachments })) {
+      setInput("")
+      setAttachments([])
+    }
+  }
+
+  const handleAddImages = () => {
+    if (!canInput) return
+    fileInputRef.current?.click()
+  }
+
+  const handleRemoveAttachment = (index: number) => {
+    setAttachments((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  const appendImageFiles = async (files: readonly File[]) => {
+    if (!canInput || files.length === 0) return
+    const nextAttachments = await buildChatImageAttachments(files, t)
+    if (nextAttachments.length === 0) return
+    setAttachments((prev) => [...prev, ...nextAttachments])
+  }
+
+  const handleImageSelection = async (
+    event: ChangeEvent<HTMLInputElement>,
+  ) => {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = ""
+    if (files.length === 0) return
+    await appendImageFiles(files)
+  }
+
+  const resetDragState = () => {
+    dragDepthRef.current = 0
+    setIsDragActive(false)
+  }
+
+  const handleComposerPaste = async (
+    event: ClipboardEvent<HTMLTextAreaElement>,
+  ) => {
+    const files = getTransferredFiles(event.clipboardData)
+    if (files.length === 0) return
+    await appendImageFiles(files)
+  }
+
+  const handleComposerDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasFileTransfer(event.dataTransfer)) return
+    event.preventDefault()
+    if (!canInput) return
+    dragDepthRef.current += 1
+    setIsDragActive(true)
+  }
+
+  const handleComposerDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasFileTransfer(event.dataTransfer)) return
+    event.preventDefault()
+    if (!canInput) {
+      resetDragState()
+      return
+    }
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+    if (dragDepthRef.current === 0) setIsDragActive(false)
+  }
+
+  const handleComposerDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasFileTransfer(event.dataTransfer)) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = canInput ? "copy" : "none"
+  }
+
+  const handleComposerDrop = async (event: DragEvent<HTMLDivElement>) => {
+    if (!hasFileTransfer(event.dataTransfer)) return
+    event.preventDefault()
+    const files = getTransferredFiles(event.dataTransfer)
+    resetDragState()
+    if (!canInput || files.length === 0) return
+    await appendImageFiles(files)
+  }
+
+  return (
+    <>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept={CHAT_IMAGE_ACCEPT}
+        multiple
+        className="hidden"
+        onChange={handleImageSelection}
+      />
+      <ChatComposer
+        input={input}
+        attachments={attachments}
+        onInputChange={setInput}
+        onAddImages={handleAddImages}
+        onPaste={handleComposerPaste}
+        onDragEnter={handleComposerDragEnter}
+        onDragLeave={handleComposerDragLeave}
+        onDragOver={handleComposerDragOver}
+        onDrop={handleComposerDrop}
+        onRemoveAttachment={handleRemoveAttachment}
+        onSend={handleSend}
+        onContextDetail={() => {
+          if (sendMessage({ content: "/context", attachments: [] })) {
+            setInput("")
+          }
+        }}
+        inputDisabledReason={inputDisabledReason}
+        canSend={canSubmit}
+        isDragActive={isDragActive}
+        contextUsage={contextUsage}
+      />
+    </>
+  )
+}
+
+export function ChatPage() {
+  const { t } = useTranslation()
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [isAtBottom, setIsAtBottom] = useState(true)
+  const [hasScrolled, setHasScrolled] = useState(false)
   const [assistantDetailVisibility, setAssistantDetailVisibility] = useAtom(
     assistantDetailVisibilityAtom,
   )
@@ -150,12 +299,12 @@ export function ChatPage() {
     handleSetDefault,
   } = useChatModels({ isConnected: isGatewayRunning })
   const hasDefaultModel = Boolean(defaultModelName)
-  const inputDisabledReason = resolveChatInputDisabledReason({
-    hasDefaultModel,
-    connectionState,
-    gatewayState: gwState,
-  })
-  const canInput = inputDisabledReason === null
+  const canInput =
+    resolveChatInputDisabledReason({
+      hasDefaultModel,
+      connectionState,
+      gatewayState: gwState,
+    }) === null
 
   const {
     sessions,
@@ -188,125 +337,6 @@ export function ChatPage() {
       syncScrollState(scrollRef.current)
     }
   }, [messages, isTyping, isAtBottom])
-
-  const handleSend = () => {
-    if ((!input.trim() && attachments.length === 0) || !canInput) return
-    if (
-      sendMessage({
-        content: input,
-        attachments,
-      })
-    ) {
-      setInput("")
-      setAttachments([])
-    }
-  }
-
-  const handleAddImages = () => {
-    if (!canInput) return
-    fileInputRef.current?.click()
-  }
-
-  const handleRemoveAttachment = (index: number) => {
-    setAttachments((prev) => prev.filter((_, itemIndex) => itemIndex !== index))
-  }
-
-  const appendImageFiles = async (files: readonly File[]) => {
-    if (!canInput || files.length === 0) {
-      return
-    }
-
-    const nextAttachments = await buildChatImageAttachments(files, t)
-    if (nextAttachments.length === 0) {
-      return
-    }
-
-    setAttachments((prev) => [...prev, ...nextAttachments])
-  }
-
-  const handleImageSelection = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files ?? [])
-    event.target.value = ""
-
-    if (files.length === 0) {
-      return
-    }
-
-    await appendImageFiles(files)
-  }
-
-  const resetDragState = () => {
-    dragDepthRef.current = 0
-    setIsDragActive(false)
-  }
-
-  const handleComposerPaste = async (
-    event: ClipboardEvent<HTMLTextAreaElement>,
-  ) => {
-    const files = getTransferredFiles(event.clipboardData)
-    if (files.length === 0) {
-      return
-    }
-
-    await appendImageFiles(files)
-  }
-
-  const handleComposerDragEnter = (event: DragEvent<HTMLDivElement>) => {
-    if (!hasFileTransfer(event.dataTransfer)) {
-      return
-    }
-
-    event.preventDefault()
-    if (!canInput) {
-      return
-    }
-    dragDepthRef.current += 1
-    setIsDragActive(true)
-  }
-
-  const handleComposerDragLeave = (event: DragEvent<HTMLDivElement>) => {
-    if (!hasFileTransfer(event.dataTransfer)) {
-      return
-    }
-
-    event.preventDefault()
-    if (!canInput) {
-      resetDragState()
-      return
-    }
-    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
-    if (dragDepthRef.current === 0) {
-      setIsDragActive(false)
-    }
-  }
-
-  const handleComposerDragOver = (event: DragEvent<HTMLDivElement>) => {
-    if (!hasFileTransfer(event.dataTransfer)) {
-      return
-    }
-
-    event.preventDefault()
-    event.dataTransfer.dropEffect = canInput ? "copy" : "none"
-  }
-
-  const handleComposerDrop = async (event: DragEvent<HTMLDivElement>) => {
-    if (!hasFileTransfer(event.dataTransfer)) {
-      return
-    }
-
-    event.preventDefault()
-    const files = getTransferredFiles(event.dataTransfer)
-    resetDragState()
-
-    if (!canInput || files.length === 0) {
-      return
-    }
-
-    await appendImageFiles(files)
-  }
-
-  const canSubmit =
-    canInput && (Boolean(input.trim()) || attachments.length > 0)
 
   return (
     <div className="bg-background/95 flex h-full flex-col">
@@ -428,36 +458,13 @@ export function ChatPage() {
         </div>
       </div>
 
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept={CHAT_IMAGE_ACCEPT}
-        multiple
-        className="hidden"
-        onChange={handleImageSelection}
-      />
-
-      <ChatComposer
-        input={input}
-        attachments={attachments}
-        onInputChange={setInput}
-        onAddImages={handleAddImages}
-        onPaste={handleComposerPaste}
-        onDragEnter={handleComposerDragEnter}
-        onDragLeave={handleComposerDragLeave}
-        onDragOver={handleComposerDragOver}
-        onDrop={handleComposerDrop}
-        onRemoveAttachment={handleRemoveAttachment}
-        onSend={handleSend}
-        onContextDetail={() => {
-          if (sendMessage({ content: "/context", attachments: [] })) {
-            setInput("")
-          }
-        }}
-        inputDisabledReason={inputDisabledReason}
-        canSend={canSubmit}
-        isDragActive={isDragActive}
+      <ChatInputArea
+        canInput={canInput}
         contextUsage={contextUsage}
+        connectionState={connectionState}
+        gatewayState={gwState}
+        hasDefaultModel={hasDefaultModel}
+        sendMessage={sendMessage}
       />
     </div>
   )
